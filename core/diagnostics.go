@@ -16,15 +16,24 @@ const (
 	maxRoundHistory = 32
 	// maxMessagesPerType caps how many messages of one type are copied into a snapshot.
 	maxMessagesPerType = 256
+
+	phaseNameNewRound = "new_round"
+	phaseNamePrepare  = "prepare"
+	phaseNameCommit   = "commit"
+	phaseNameFin      = "fin"
 )
 
 // SequenceStatus describes whether a consensus sequence is live on this node.
 type SequenceStatus string
 
 const (
-	SequenceInactive  SequenceStatus = "inactive"
-	SequenceRunning   SequenceStatus = "running"
+	// SequenceInactive is the status before the first sequence starts.
+	SequenceInactive SequenceStatus = "inactive"
+	// SequenceRunning is the status while a height is being agreed.
+	SequenceRunning SequenceStatus = "running"
+	// SequenceCompleted is the status after the height is committed.
 	SequenceCompleted SequenceStatus = "completed"
+	// SequenceCancelled is the status after the sequence is aborted.
 	SequenceCancelled SequenceStatus = "cancelled"
 )
 
@@ -32,12 +41,18 @@ const (
 type RoundEndReason string
 
 const (
-	RoundEndTimeout    RoundEndReason = "timeout"
+	// RoundEndTimeout is set when the round timer expires.
+	RoundEndTimeout RoundEndReason = "timeout"
+	// RoundEndFutureProp is set when a future-round proposal is accepted.
 	RoundEndFutureProp RoundEndReason = "future_proposal"
-	RoundEndRCC        RoundEndReason = "round_change_certificate"
-	RoundEndCommitted  RoundEndReason = "committed"
-	RoundEndCancelled  RoundEndReason = "cancelled"
-	RoundEndUnknown    RoundEndReason = "unknown"
+	// RoundEndRCC is set when a round-change certificate advances the round.
+	RoundEndRCC RoundEndReason = "round_change_certificate"
+	// RoundEndCommitted is set when the height is committed.
+	RoundEndCommitted RoundEndReason = "committed"
+	// RoundEndCancelled is set when the sequence is aborted.
+	RoundEndCancelled RoundEndReason = "cancelled"
+	// RoundEndUnknown is set when the end reason was not recorded.
+	RoundEndUnknown RoundEndReason = "unknown"
 )
 
 // ConsensusState is an immutable, race-safe snapshot of this node's IBFT view.
@@ -166,9 +181,17 @@ type CommittedSealSnapshot struct {
 // messageSnapshotter is implemented by *messages.Messages; optional on the Messages interface.
 type messageSnapshotter interface {
 	// TryGetViewMessages never waits: ok=false when the lock is busy.
-	TryGetViewMessages(view *proto.View, messageType proto.MessageType, max int) (msgs []*proto.IbftMessage, ok bool, truncated bool)
+	TryGetViewMessages(
+		view *proto.View,
+		messageType proto.MessageType,
+		limit int,
+	) (msgs []*proto.IbftMessage, ok bool, truncated bool)
 	// GetViewMessages waits for the lock; used from the consensus goroutine only.
-	GetViewMessages(view *proto.View, messageType proto.MessageType, max int) (msgs []*proto.IbftMessage, truncated bool)
+	GetViewMessages(
+		view *proto.View,
+		messageType proto.MessageType,
+		limit int,
+	) (msgs []*proto.IbftMessage, truncated bool)
 }
 
 // proposerCache memoizes the proposer for one (height, round) so diagnostics
@@ -199,8 +222,9 @@ func (c *proposerCache) set(height, round uint64, proposer []byte) {
 
 	c.height = height
 	c.round = round
-	c.proposer = append([]byte(nil), proposer...)
 	c.valid = true
+
+	c.proposer = append([]byte(nil), proposer...)
 }
 
 // DiagnosticsEvents returns a coalesced change-notification channel.
@@ -355,68 +379,96 @@ func (i *IBFT) buildHeightState(now time.Time, blocking bool) (*HeightState, []s
 	snapper, hasSnapper := i.messages.(messageSnapshotter)
 	if !hasSnapper {
 		unavailable = append(unavailable, "messages")
-	} else {
-		for _, mt := range []proto.MessageType{
-			proto.MessageType_PREPREPARE,
-			proto.MessageType_PREPARE,
-			proto.MessageType_COMMIT,
-			proto.MessageType_ROUND_CHANGE,
-		} {
-			name := messageTypeName(mt)
 
-			var (
-				msgs      []*proto.IbftMessage
-				ok        bool
-				truncated bool
-			)
-
-			if blocking {
-				msgs, truncated = snapper.GetViewMessages(view, mt, maxMessagesPerType)
-				ok = true
-			} else {
-				msgs, ok, truncated = snapper.TryGetViewMessages(view, mt, maxMessagesPerType)
-			}
-
-			if !ok {
-				unavailable = append(unavailable, "messages."+name)
-				height.Messages[name] = MessageTypeSnapshot{Available: false}
-				height.Quorum[name] = QuorumProgress{Available: false}
-
-				continue
-			}
-
-			if truncated {
-				unavailable = append(unavailable, "messages."+name+".truncated")
-			}
-
-			entry := MessageTypeSnapshot{
-				Available:  true,
-				Truncated:  truncated,
-				ViewHeight: view.Height,
-				ViewRound:  view.Round,
-				Messages:   make([]MessageSnapshot, 0, len(msgs)),
-			}
-			for _, m := range msgs {
-				entry.Messages = append(entry.Messages, toMessageSnapshot(m))
-			}
-
-			height.Messages[name] = entry
-
-			if vok {
-				height.Quorum[name] = computeQuorumProgress(
-					mt,
-					msgs,
-					viewSnap.proposalFrom,
-					powerIndex,
-					quorumSize,
-				)
-			} else {
-				height.Quorum[name] = QuorumProgress{Available: false, Count: len(msgs)}
-			}
-		}
+		return height, unavailable
 	}
 
+	i.collectMessageSnapshots(
+		height,
+		view,
+		viewSnap,
+		powerIndex,
+		quorumSize,
+		vok,
+		blocking,
+		snapper,
+		&unavailable,
+	)
+
 	return height, unavailable
+}
+
+//nolint:revive // blocking selects try vs wait lock
+func (i *IBFT) collectMessageSnapshots(
+	height *HeightState,
+	view *proto.View,
+	viewSnap stateSnapshot,
+	powerIndex map[string]*big.Int,
+	quorumSize string,
+	vok bool,
+	blocking bool,
+	snapper messageSnapshotter,
+	unavailable *[]string,
+) {
+	for _, mt := range []proto.MessageType{
+		proto.MessageType_PREPREPARE,
+		proto.MessageType_PREPARE,
+		proto.MessageType_COMMIT,
+		proto.MessageType_ROUND_CHANGE,
+	} {
+		name := messageTypeName(mt)
+
+		var (
+			msgs      []*proto.IbftMessage
+			ok        bool
+			truncated bool
+		)
+
+		if blocking {
+			msgs, truncated = snapper.GetViewMessages(view, mt, maxMessagesPerType)
+			ok = true
+		} else {
+			msgs, ok, truncated = snapper.TryGetViewMessages(view, mt, maxMessagesPerType)
+		}
+
+		if !ok {
+			*unavailable = append(*unavailable, "messages."+name)
+			height.Messages[name] = MessageTypeSnapshot{Available: false}
+			height.Quorum[name] = QuorumProgress{Available: false}
+
+			continue
+		}
+
+		if truncated {
+			*unavailable = append(*unavailable, "messages."+name+".truncated")
+		}
+
+		entry := MessageTypeSnapshot{
+			Available:  true,
+			Truncated:  truncated,
+			ViewHeight: view.Height,
+			ViewRound:  view.Round,
+			Messages:   make([]MessageSnapshot, 0, len(msgs)),
+		}
+
+		for _, m := range msgs {
+			entry.Messages = append(entry.Messages, toMessageSnapshot(m))
+		}
+
+		height.Messages[name] = entry
+
+		if vok {
+			height.Quorum[name] = computeQuorumProgress(
+				mt,
+				msgs,
+				viewSnap.proposalFrom,
+				powerIndex,
+				quorumSize,
+			)
+		} else {
+			height.Quorum[name] = QuorumProgress{Available: false, Count: len(msgs)}
+		}
+	}
 }
 
 // resolveProposer returns the proposer for (height, round). The accepted
@@ -468,6 +520,8 @@ type stateSnapshot struct {
 
 // snapshot copies the diagnostics-relevant state. With blocking=false it
 // returns ok=false instead of waiting on a contended lock.
+//
+//nolint:revive // blocking selects try vs wait lock
 func (s *state) snapshot(blocking bool) (stateSnapshot, bool) {
 	if blocking {
 		s.RLock()
@@ -504,6 +558,7 @@ func (s *state) snapshot(blocking bool) (stateSnapshot, bool) {
 		hash := messages.ExtractProposalHash(s.proposalMessage)
 		proposal := messages.ExtractProposal(s.proposalMessage)
 		ps := &ProposalSnapshot{Available: true}
+
 		if hash != nil {
 			ps.Hash = append([]byte(nil), hash...)
 		}
@@ -516,34 +571,17 @@ func (s *state) snapshot(blocking bool) (stateSnapshot, bool) {
 		}
 
 		out.proposal = ps
+
 		out.proposalFrom = append([]byte(nil), s.proposalMessage.From...)
 	} else {
 		out.proposal = &ProposalSnapshot{Available: false}
 	}
 
-	if s.latestPC != nil {
-		pc := &PreparedCertificateSnapshot{Available: true}
-		if s.latestPC.ProposalMessage != nil {
-			pc.ProposalFrom = append([]byte(nil), s.latestPC.ProposalMessage.From...)
-			h := messages.ExtractProposalHash(s.latestPC.ProposalMessage)
-			if h != nil {
-				pc.ProposalHash = append([]byte(nil), h...)
-			}
-		}
-
-		pc.PrepareCount = len(s.latestPC.PrepareMessages)
-		pc.PrepareSenders = make([][]byte, 0, len(s.latestPC.PrepareMessages))
-		for _, m := range s.latestPC.PrepareMessages {
-			if m != nil {
-				pc.PrepareSenders = append(pc.PrepareSenders, append([]byte(nil), m.From...))
-			}
-		}
-
-		out.latestPC = pc
-	}
+	out.latestPC = preparedCertificateFromState(s.latestPC)
 
 	if len(s.seals) > 0 {
 		out.seals = make([]CommittedSealSnapshot, 0, len(s.seals))
+
 		for _, seal := range s.seals {
 			if seal == nil {
 				continue
@@ -560,7 +598,11 @@ func (s *state) snapshot(blocking bool) (stateSnapshot, bool) {
 }
 
 // snapshot returns validators sorted by ID for deterministic output.
-func (vm *ValidatorManager) snapshot(blocking bool) (validators []ValidatorSnapshot, quorumSize, totalPower string, ok bool) {
+//
+//nolint:revive // try/wait lock + compact validator snapshot
+func (vm *ValidatorManager) snapshot(
+	blocking bool,
+) (validators []ValidatorSnapshot, quorumSize, totalPower string, ok bool) {
 	if blocking {
 		vm.vpLock.RLock()
 	} else if !vm.vpLock.TryRLock() {
@@ -602,6 +644,7 @@ func (vm *ValidatorManager) snapshot(blocking bool) (validators []ValidatorSnaps
 
 func buildPowerIndex(validators []ValidatorSnapshot) map[string]*big.Int {
 	idx := make(map[string]*big.Int, len(validators))
+
 	for _, v := range validators {
 		p, ok := new(big.Int).SetString(v.VotingPower, 10)
 		if !ok {
@@ -614,6 +657,7 @@ func buildPowerIndex(validators []ValidatorSnapshot) map[string]*big.Int {
 	return idx
 }
 
+//nolint:revive // message type + voter inputs stay together
 func computeQuorumProgress(
 	mt proto.MessageType,
 	msgs []*proto.IbftMessage,
@@ -630,76 +674,97 @@ func computeQuorumProgress(
 
 	switch mt {
 	case proto.MessageType_PREPREPARE:
-		progress.RequiredPower = "1"
-		if len(msgs) >= 1 {
-			progress.ReceivedPower = "1"
-			progress.HasQuorum = true
-		}
-
-		return progress
+		return quorumPreprepare(progress, msgs)
 	case proto.MessageType_PREPARE:
-		received := big.NewInt(0)
-		seen := make(map[string]struct{}, len(msgs)+1)
-
-		if len(proposalFrom) > 0 {
-			seen[string(proposalFrom)] = struct{}{}
-			if p, ok := powerIndex[string(proposalFrom)]; ok {
-				received = new(big.Int).Add(received, p)
-				progress.ProposerImplied = true
-			}
-		}
-
-		for _, m := range msgs {
-			if m == nil {
-				continue
-			}
-
-			key := string(m.From)
-			if _, dup := seen[key]; dup {
-				continue
-			}
-
-			seen[key] = struct{}{}
-			if p, ok := powerIndex[key]; ok {
-				received = new(big.Int).Add(received, p)
-			}
-		}
-
-		progress.ReceivedPower = received.String()
-		req, ok := new(big.Int).SetString(quorumSize, 10)
-		if ok {
-			progress.HasQuorum = received.Cmp(req) >= 0
-		}
-
-		return progress
+		return quorumPrepare(progress, msgs, proposalFrom, powerIndex, quorumSize)
+	case proto.MessageType_COMMIT, proto.MessageType_ROUND_CHANGE:
+		return quorumByVoters(progress, msgs, powerIndex, quorumSize)
 	default:
-		received := big.NewInt(0)
-		seen := make(map[string]struct{}, len(msgs))
-
-		for _, m := range msgs {
-			if m == nil {
-				continue
-			}
-
-			key := string(m.From)
-			if _, dup := seen[key]; dup {
-				continue
-			}
-
-			seen[key] = struct{}{}
-			if p, ok := powerIndex[key]; ok {
-				received = new(big.Int).Add(received, p)
-			}
-		}
-
-		progress.ReceivedPower = received.String()
-		req, ok := new(big.Int).SetString(quorumSize, 10)
-		if ok {
-			progress.HasQuorum = received.Cmp(req) >= 0
-		}
-
-		return progress
+		return quorumByVoters(progress, msgs, powerIndex, quorumSize)
 	}
+}
+
+func quorumPreprepare(progress QuorumProgress, msgs []*proto.IbftMessage) QuorumProgress {
+	progress.RequiredPower = "1"
+	if len(msgs) >= 1 {
+		progress.ReceivedPower = "1"
+		progress.HasQuorum = true
+	}
+
+	return progress
+}
+
+//nolint:revive // same voter inputs as computeQuorumProgress
+func quorumPrepare(
+	progress QuorumProgress,
+	msgs []*proto.IbftMessage,
+	proposalFrom []byte,
+	powerIndex map[string]*big.Int,
+	quorumSize string,
+) QuorumProgress {
+	received := big.NewInt(0)
+	seen := make(map[string]struct{}, len(msgs)+1)
+
+	if len(proposalFrom) > 0 {
+		seen[string(proposalFrom)] = struct{}{}
+
+		if p, ok := powerIndex[string(proposalFrom)]; ok {
+			received = new(big.Int).Add(received, p)
+			progress.ProposerImplied = true
+		}
+	}
+
+	return finishQuorum(progress, sumVoterPower(received, seen, msgs, powerIndex), quorumSize)
+}
+
+func quorumByVoters(
+	progress QuorumProgress,
+	msgs []*proto.IbftMessage,
+	powerIndex map[string]*big.Int,
+	quorumSize string,
+) QuorumProgress {
+	received := sumVoterPower(big.NewInt(0), make(map[string]struct{}, len(msgs)), msgs, powerIndex)
+
+	return finishQuorum(progress, received, quorumSize)
+}
+
+func sumVoterPower(
+	received *big.Int,
+	seen map[string]struct{},
+	msgs []*proto.IbftMessage,
+	powerIndex map[string]*big.Int,
+) *big.Int {
+	total := new(big.Int).Set(received)
+
+	for _, m := range msgs {
+		if m == nil {
+			continue
+		}
+
+		key := string(m.From)
+		if _, dup := seen[key]; dup {
+			continue
+		}
+
+		seen[key] = struct{}{}
+
+		if p, ok := powerIndex[key]; ok {
+			total = new(big.Int).Add(total, p)
+		}
+	}
+
+	return total
+}
+
+func finishQuorum(progress QuorumProgress, received *big.Int, quorumSize string) QuorumProgress {
+	progress.ReceivedPower = received.String()
+	req, ok := new(big.Int).SetString(quorumSize, 10)
+
+	if ok {
+		progress.HasQuorum = received.Cmp(req) >= 0
+	}
+
+	return progress
 }
 
 func toMessageSnapshot(m *proto.IbftMessage) MessageSnapshot {
@@ -724,9 +789,11 @@ func toMessageSnapshot(m *proto.IbftMessage) MessageSnapshot {
 		out.ProposalHash = append([]byte(nil), messages.ExtractPrepareHash(m)...)
 	case proto.MessageType_COMMIT:
 		out.ProposalHash = append([]byte(nil), messages.ExtractCommitHash(m)...)
+
 		if seal := messages.ExtractCommittedSeal(m); seal != nil {
 			out.CommittedSeal = append([]byte(nil), seal.Signature...)
 		}
+	case proto.MessageType_ROUND_CHANGE:
 	}
 
 	return out
@@ -737,9 +804,9 @@ func messageTypeName(mt proto.MessageType) string {
 	case proto.MessageType_PREPREPARE:
 		return "preprepare"
 	case proto.MessageType_PREPARE:
-		return "prepare"
+		return phaseNamePrepare
 	case proto.MessageType_COMMIT:
-		return "commit"
+		return phaseNameCommit
 	case proto.MessageType_ROUND_CHANGE:
 		return "round_change"
 	default:
@@ -750,13 +817,13 @@ func messageTypeName(mt proto.MessageType) string {
 func canonicalPhaseName(s stateType) string {
 	switch s {
 	case newRound:
-		return "new_round"
+		return phaseNameNewRound
 	case prepare:
-		return "prepare"
+		return phaseNamePrepare
 	case commit:
-		return "commit"
+		return phaseNameCommit
 	case fin:
-		return "fin"
+		return phaseNameFin
 	default:
 		return s.String()
 	}

@@ -22,11 +22,11 @@ func (s stateType) String() string {
 	case newRound:
 		return "new round"
 	case prepare:
-		return "prepare"
+		return phaseNamePrepare
 	case commit:
-		return "commit"
+		return phaseNameCommit
 	case fin:
-		return "fin"
+		return phaseNameFin
 	}
 
 	return ""
@@ -315,6 +315,7 @@ func (s *state) transitionPhaseLocked(now time.Time, next stateType) phaseEndEve
 		ev.endedAt = now
 		ev.duration = duration
 		ev.proposer, ev.proposal = proposalSnapshotFromMessage(s.proposalMessage)
+
 		if s.latestPC != nil {
 			ev.latestPC = clonePreparedCertificate(preparedCertificateFromState(s.latestPC))
 		}
@@ -348,6 +349,7 @@ func (s *state) finishRoundLocked(now time.Time, reason RoundEndReason) (RoundSu
 		ev.endedAt = now
 		ev.duration = duration
 		ev.proposer, ev.proposal = proposalSnapshotFromMessage(s.proposalMessage)
+
 		if s.latestPC != nil {
 			ev.latestPC = clonePreparedCertificate(preparedCertificateFromState(s.latestPC))
 		}
@@ -417,6 +419,7 @@ func preparedCertificateFromState(pc *proto.PreparedCertificate) *PreparedCertif
 
 	out.PrepareCount = len(pc.PrepareMessages)
 	out.PrepareSenders = make([][]byte, 0, len(pc.PrepareMessages))
+
 	for _, m := range pc.PrepareMessages {
 		if m != nil {
 			out.PrepareSenders = append(out.PrepareSenders, append([]byte(nil), m.From...))

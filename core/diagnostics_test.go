@@ -30,7 +30,7 @@ func TestTryGetConsensusState_Inactive(t *testing.T) {
 	assert.Equal(t, SequenceInactive, snap.Current.Status)
 	assert.True(t, snap.Complete)
 	assert.Equal(t, []byte("node-a"), snap.NodeID)
-	assert.Equal(t, "new_round", snap.Current.Phase)
+	assert.Equal(t, phaseNameNewRound, snap.Current.Phase)
 }
 
 func TestTryGetConsensusState_PhaseArchive(t *testing.T) {
@@ -58,8 +58,8 @@ func TestTryGetConsensusState_PhaseArchive(t *testing.T) {
 
 	i := NewIBFT(mockLogger{}, backend, mockTransport{})
 	require.NoError(t, i.validatorManager.Init(1))
-
 	i.state.reset(1)
+
 	started := time.Now().Add(-2 * time.Second)
 	i.state.markSequenceStarted(started)
 	i.archive.beginHeight(1, started)
@@ -99,22 +99,27 @@ func TestTryGetConsensusState_PhaseArchive(t *testing.T) {
 	require.NotNil(t, snap)
 	require.NotNil(t, snap.Current)
 	assert.Equal(t, SequenceRunning, snap.Current.Status)
-	assert.Equal(t, "prepare", snap.Current.Phase)
+	assert.Equal(t, phaseNamePrepare, snap.Current.Phase)
 	require.GreaterOrEqual(t, len(snap.Current.PhaseSnapshots), 2)
 
 	var foundCompletedNewRound bool
+
 	var foundInProgressPrepare bool
+
 	for _, p := range snap.Current.PhaseSnapshots {
-		if p.Phase == "new_round" && p.Status == phaseStatusCompleted {
+		if p.Phase == phaseNameNewRound && p.Status == phaseStatusCompleted {
 			foundCompletedNewRound = true
+
 			assert.Equal(t, uint64(1), p.Height)
 			assert.True(t, p.Messages["preprepare"].Available)
 			assert.Equal(t, 1, len(p.Messages["preprepare"].Messages))
 		}
-		if p.Phase == "prepare" && p.Status == phaseStatusInProgress {
+
+		if p.Phase == phaseNamePrepare && p.Status == phaseStatusInProgress {
 			foundInProgressPrepare = true
 		}
 	}
+
 	assert.True(t, foundCompletedNewRound)
 	assert.True(t, foundInProgressPrepare)
 }
@@ -209,12 +214,16 @@ func TestTryGetConsensusState_ConcurrentSafe(t *testing.T) {
 	defer cancel()
 
 	var wg sync.WaitGroup
+
 	wg.Add(1)
 
-	go func() {
+	runSeq := func() {
 		defer wg.Done()
+
 		i.RunSequence(ctx, 10)
-	}()
+	}
+
+	go runSeq()
 
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
@@ -223,6 +232,7 @@ func TestTryGetConsensusState_ConcurrentSafe(t *testing.T) {
 		_ = snap.Complete
 		_ = snap.Current
 		_ = snap.LastFinalized
+
 		time.Sleep(time.Millisecond)
 	}
 
@@ -238,6 +248,7 @@ func TestDiagnosticsEvents_CoalescesWithoutBlocking(t *testing.T) {
 	}, mockTransport{})
 
 	const notifications = 100_000
+
 	done := make(chan struct{})
 
 	go func() {
@@ -294,7 +305,7 @@ func TestDiagnosticsEvents_PhaseArchivePublishedBeforeWakeup(t *testing.T) {
 	snap := i.TryGetConsensusState()
 	require.NotNil(t, snap.Current)
 	require.NotEmpty(t, snap.Current.PhaseSnapshots)
-	assert.Equal(t, "new_round", snap.Current.PhaseSnapshots[0].Phase)
+	assert.Equal(t, phaseNameNewRound, snap.Current.PhaseSnapshots[0].Phase)
 	assert.Equal(t, phaseStatusCompleted, snap.Current.PhaseSnapshots[0].Status)
 }
 
@@ -389,6 +400,7 @@ func TestTryGetConsensusState_ProposerResolvedOnceAndCached(t *testing.T) {
 	for _, v := range second.Current.Validators {
 		ids = append(ids, string(v.ID))
 	}
+
 	assert.Equal(t, []string{"n1", "n2", "n3"}, ids)
 }
 
@@ -413,20 +425,26 @@ func TestFinalizeSequenceArchive_CompletedUnderReadContention(t *testing.T) {
 	// Hammer the state with readers while the sequence is finalized so that a
 	// try-lock would frequently fail; the archive must still be correct.
 	stop := make(chan struct{})
+
 	var wg sync.WaitGroup
+
+	readLoop := func() {
+		defer wg.Done()
+
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				_ = i.TryGetConsensusState()
+			}
+		}
+	}
+
 	for r := 0; r < 4; r++ {
 		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for {
-				select {
-				case <-stop:
-					return
-				default:
-					_ = i.TryGetConsensusState()
-				}
-			}
-		}()
+
+		go readLoop()
 	}
 
 	i.finalizeSequenceArchive(i.state.markSequenceCompleted(RoundEndCommitted))

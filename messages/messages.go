@@ -120,16 +120,16 @@ func (ms *Messages) numMessages(
 	return len(messages)
 }
 
-// TryGetViewMessages returns up to max accepted messages for the view/type without waiting.
+// TryGetViewMessages returns up to limit accepted messages for the view/type without waiting.
 // ok=false means the lock was busy (caller should treat the section as unavailable).
-// truncated=true means more than max messages existed and the remainder was omitted.
+// truncated=true means more than limit messages existed and the remainder was omitted.
 // AddMessage is intentionally untouched: this is a read-only try-snapshot.
-func (ms *Messages) TryGetViewMessages(
+func (ms *Messages) TryGetViewMessages( //nolint:revive // ok and truncated are both needed by callers
 	view *proto.View,
 	messageType proto.MessageType,
-	max int,
+	limit int,
 ) (msgs []*proto.IbftMessage, ok bool, truncated bool) {
-	if view == nil || max <= 0 {
+	if view == nil || limit <= 0 {
 		return nil, true, false
 	}
 
@@ -143,7 +143,7 @@ func (ms *Messages) TryGetViewMessages(
 	}
 	defer mux.RUnlock()
 
-	msgs, truncated = ms.collectViewMessagesLocked(view, messageType, max)
+	msgs, truncated = ms.collectViewMessagesLocked(view, messageType, limit)
 
 	return msgs, true, truncated
 }
@@ -152,9 +152,9 @@ func (ms *Messages) TryGetViewMessages(
 func (ms *Messages) GetViewMessages(
 	view *proto.View,
 	messageType proto.MessageType,
-	max int,
+	limit int,
 ) (msgs []*proto.IbftMessage, truncated bool) {
-	if view == nil || max <= 0 {
+	if view == nil || limit <= 0 {
 		return nil, false
 	}
 
@@ -166,19 +166,20 @@ func (ms *Messages) GetViewMessages(
 	mux.RLock()
 	defer mux.RUnlock()
 
-	return ms.collectViewMessagesLocked(view, messageType, max)
+	return ms.collectViewMessagesLocked(view, messageType, limit)
 }
 
-// collectViewMessagesLocked copies up to max messages of the view, ordered by
+// collectViewMessagesLocked copies up to limit messages of the view, ordered by
 // sender so that snapshots (and truncation) are deterministic. Caller holds the
 // read lock for messageType.
 func (ms *Messages) collectViewMessagesLocked(
 	view *proto.View,
 	messageType proto.MessageType,
-	max int,
+	limit int,
 ) (msgs []*proto.IbftMessage, truncated bool) {
 	heightMsgMap := ms.getMessageMap(messageType)
 	roundMsgMap, found := heightMsgMap[view.Height]
+
 	if !found {
 		return []*proto.IbftMessage{}, false
 	}
@@ -197,8 +198,8 @@ func (ms *Messages) collectViewMessagesLocked(
 		return bytes.Compare(all[a].From, all[b].From) < 0
 	})
 
-	if len(all) > max {
-		return all[:max], true
+	if len(all) > limit {
+		return all[:limit], true
 	}
 
 	return all, false

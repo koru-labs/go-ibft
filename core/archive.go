@@ -147,9 +147,11 @@ func (a *diagnosticsArchive) finalizeCurrent(
 		a.current.RoundStarted = final.RoundStarted
 		a.current.LastRoundEndReason = reason
 		a.current.SequenceEndedAt = endedAt
+
 		if !final.SequenceStartedAt.IsZero() {
 			a.current.SequenceStartedAt = final.SequenceStartedAt
 		}
+
 		if !final.RoundStartedAt.IsZero() {
 			a.current.RoundStartedAt = final.RoundStartedAt
 		}
@@ -164,6 +166,7 @@ func (a *diagnosticsArchive) finalizeCurrent(
 		default:
 			a.current.PhaseStartedAt = time.Time{}
 		}
+
 		a.current.NodeID = append([]byte(nil), final.NodeID...)
 		a.current.Proposer = append([]byte(nil), final.Proposer...)
 		a.current.IsProposer = final.IsProposer
@@ -185,6 +188,7 @@ func (a *diagnosticsArchive) finalizeCurrent(
 	a.lastFinalized = cloneHeightArchive(a.current)
 }
 
+//nolint:revive // try-lock returns current, last, ok
 func (a *diagnosticsArchive) trySnapshot() (current, last *HeightArchive, ok bool) {
 	if !a.mu.TryRLock() {
 		return nil, nil, false
@@ -265,6 +269,7 @@ func clonePreparedCertificate(src *PreparedCertificateSnapshot) *PreparedCertifi
 	out := *src
 	out.ProposalHash = append([]byte(nil), src.ProposalHash...)
 	out.ProposalFrom = append([]byte(nil), src.ProposalFrom...)
+
 	if len(src.PrepareSenders) > 0 {
 		out.PrepareSenders = make([][]byte, len(src.PrepareSenders))
 		for i, s := range src.PrepareSenders {

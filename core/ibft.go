@@ -1054,6 +1054,7 @@ func (i *IBFT) recordPhaseEnd(ev phaseEndEvent) {
 	for name, group := range snap.Messages {
 		snap.Messages[name] = compactMessageTypeSnapshot(group)
 	}
+
 	i.archive.appendPhase(snap)
 	i.notifyDiagnosticsChanged()
 }
