@@ -1,6 +1,8 @@
 package messages
 
 import (
+	"bytes"
+	"sort"
 	"sync"
 
 	"github.com/0xPolygon/go-ibft/messages/proto"
@@ -116,6 +118,91 @@ func (ms *Messages) numMessages(
 	}
 
 	return len(messages)
+}
+
+// TryGetViewMessages returns up to limit accepted messages for the view/type without waiting.
+// ok=false means the lock was busy (caller should treat the section as unavailable).
+// truncated=true means more than limit messages existed and the remainder was omitted.
+// AddMessage is intentionally untouched: this is a read-only try-snapshot.
+func (ms *Messages) TryGetViewMessages( //nolint:revive // ok and truncated are both needed by callers
+	view *proto.View,
+	messageType proto.MessageType,
+	limit int,
+) (msgs []*proto.IbftMessage, ok bool, truncated bool) {
+	if view == nil || limit <= 0 {
+		return nil, true, false
+	}
+
+	mux := ms.muxMap[messageType]
+	if mux == nil {
+		return nil, true, false
+	}
+
+	if !mux.TryRLock() {
+		return nil, false, false
+	}
+	defer mux.RUnlock()
+
+	msgs, truncated = ms.collectViewMessagesLocked(view, messageType, limit)
+
+	return msgs, true, truncated
+}
+
+// GetViewMessages is the blocking counterpart of TryGetViewMessages.
+func (ms *Messages) GetViewMessages(
+	view *proto.View,
+	messageType proto.MessageType,
+	limit int,
+) (msgs []*proto.IbftMessage, truncated bool) {
+	if view == nil || limit <= 0 {
+		return nil, false
+	}
+
+	mux := ms.muxMap[messageType]
+	if mux == nil {
+		return nil, false
+	}
+
+	mux.RLock()
+	defer mux.RUnlock()
+
+	return ms.collectViewMessagesLocked(view, messageType, limit)
+}
+
+// collectViewMessagesLocked copies up to limit messages of the view, ordered by
+// sender so that snapshots (and truncation) are deterministic. Caller holds the
+// read lock for messageType.
+func (ms *Messages) collectViewMessagesLocked(
+	view *proto.View,
+	messageType proto.MessageType,
+	limit int,
+) (msgs []*proto.IbftMessage, truncated bool) {
+	heightMsgMap := ms.getMessageMap(messageType)
+	roundMsgMap, found := heightMsgMap[view.Height]
+
+	if !found {
+		return []*proto.IbftMessage{}, false
+	}
+
+	stored, found := roundMsgMap[view.Round]
+	if !found || len(stored) == 0 {
+		return []*proto.IbftMessage{}, false
+	}
+
+	all := make([]*proto.IbftMessage, 0, len(stored))
+	for _, message := range stored {
+		all = append(all, message)
+	}
+
+	sort.Slice(all, func(a, b int) bool {
+		return bytes.Compare(all[a].From, all[b].From) < 0
+	})
+
+	if len(all) > limit {
+		return all[:limit], true
+	}
+
+	return all, false
 }
 
 // PruneByHeight prunes out all old messages from the message queues

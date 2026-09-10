@@ -104,6 +104,16 @@ type IBFT struct {
 
 	// validatorManager keeps quorumSize and voting power information
 	validatorManager *ValidatorManager
+
+	// archive retains finalized phase/height diagnostics for the API.
+	archive *diagnosticsArchive
+
+	// diagnosticsEvents is a capacity-one, coalesced wakeup signal for
+	// out-of-band diagnostics consumers. Sends must never block consensus.
+	diagnosticsEvents chan struct{}
+
+	// proposerCache memoizes the resolved proposer per (height, round) for diagnostics.
+	proposerCache proposerCache
 }
 
 // NewIBFT creates a new instance of the IBFT consensus protocol
@@ -126,12 +136,15 @@ func NewIBFT(
 				Height: 0,
 				Round:  0,
 			},
-			seals:        make([]*messages.CommittedSeal, 0),
-			roundStarted: false,
-			name:         newRound,
+			seals:          make([]*messages.CommittedSeal, 0),
+			roundStarted:   false,
+			name:           newRound,
+			sequenceStatus: SequenceInactive,
 		},
-		baseRoundTimeout: DefaultBaseRoundTimeout,
-		validatorManager: NewValidatorManager(backend, log),
+		baseRoundTimeout:  DefaultBaseRoundTimeout,
+		validatorManager:  NewValidatorManager(backend, log),
+		archive:           newDiagnosticsArchive(),
+		diagnosticsEvents: make(chan struct{}, 1),
 	}
 }
 
@@ -306,9 +319,13 @@ func (i *IBFT) RunSequence(ctx context.Context, h uint64) {
 
 	// Set the starting state data
 	i.state.reset(h)
+	i.state.markSequenceStarted(startTime)
+	i.archive.beginHeight(h, startTime)
+	i.notifyDiagnosticsChanged()
 
 	if err := i.validatorManager.Init(h); err != nil {
 		i.log.Error("failed to run sequence - validator manager init", "height", h, "error", err)
+		i.finalizeSequenceArchive(i.state.markSequenceCancelled())
 
 		return
 	}
@@ -367,28 +384,30 @@ func (i *IBFT) runRound(ctx context.Context, h uint64) bool {
 		teardown()
 		i.log.Info("received future proposal", "round", ev.round)
 
-		i.moveToNewRound(ev.round)
+		i.moveToNewRound(ev.round, RoundEndFutureProp)
 		i.acceptProposal(ev.proposalMessage)
 		i.state.setRoundStarted(true)
+		i.notifyDiagnosticsChanged()
 		i.sendPrepareMessage(view)
 	case round := <-i.roundCertificate:
 		teardown()
 		i.log.Info("received future RCC", "round", round)
 
-		i.moveToNewRound(round)
+		i.moveToNewRound(round, RoundEndRCC)
 	case <-i.roundExpired:
 		teardown()
 		i.log.Info("round timeout expired", "round", currentRound)
 
-		newRound := currentRound + 1
-		i.moveToNewRound(newRound)
+		nextRound := currentRound + 1
+		i.moveToNewRound(nextRound, RoundEndTimeout)
 
-		i.sendRoundChangeMessage(h, newRound)
+		i.sendRoundChangeMessage(h, nextRound)
 	case <-i.roundDone:
 		// The consensus cycle for the block height is finished.
 		// Stop all running worker threads
 		teardown()
 		i.insertBlock()
+		i.finalizeSequenceArchive(i.state.markSequenceCompleted(RoundEndCommitted))
 
 		return false
 	case <-ctxRound.Done():
@@ -398,6 +417,7 @@ func (i *IBFT) runRound(ctx context.Context, h uint64) bool {
 			i.log.Error("failed to handle sequence cancelled callback on backend", "view", view, "err", err)
 		}
 
+		i.finalizeSequenceArchive(i.state.markSequenceCancelled())
 		i.log.Debug("sequence cancelled")
 
 		return false
@@ -412,6 +432,7 @@ func (i *IBFT) startRound(ctx context.Context) {
 	defer i.wg.Done()
 
 	i.state.newRound()
+	i.notifyDiagnosticsChanged()
 
 	var (
 		id   = i.backend.ID()
@@ -629,7 +650,7 @@ func (i *IBFT) runNewRound(ctx context.Context) error {
 			i.log.Debug("prepare message multicasted")
 
 			// Move to the prepare state
-			i.state.changeState(prepare)
+			i.recordPhaseEnd(i.state.changeState(prepare))
 
 			return nil
 		}
@@ -889,13 +910,13 @@ func (i *IBFT) handlePrepare(view *proto.View) bool {
 
 	i.log.Debug("commit message multicasted")
 
-	i.state.finalizePrepare(
+	i.recordPhaseEnd(i.state.finalizePrepare(
 		&proto.PreparedCertificate{
 			ProposalMessage: i.state.getProposalMessage(),
 			PrepareMessages: prepareMessages,
 		},
 		i.state.getProposal(),
-	)
+	))
 
 	return true
 }
@@ -973,7 +994,7 @@ func (i *IBFT) handleCommit(view *proto.View) bool {
 	i.state.setCommittedSeals(commitSeals)
 
 	//	Move to the fin state
-	i.state.changeState(fin)
+	i.recordPhaseEnd(i.state.changeState(fin))
 
 	return true
 }
@@ -1002,16 +1023,128 @@ func (i *IBFT) insertBlock() {
 	i.messages.PruneByHeight(i.state.getHeight())
 }
 
-// moveToNewRound moves the state to the new round
-func (i *IBFT) moveToNewRound(round uint64) {
-	i.state.setView(&proto.View{
-		Height: i.state.getHeight(),
-		Round:  round,
-	})
+// moveToNewRound moves the state to the new round and records why the previous round ended.
+func (i *IBFT) moveToNewRound(round uint64, reason RoundEndReason) {
+	_, ev := i.state.moveToRound(round, reason)
+	i.recordPhaseEnd(ev)
+	i.notifyDiagnosticsChanged()
+}
 
-	i.state.setRoundStarted(false)
-	i.state.setProposalMessage(nil)
-	i.state.changeState(newRound)
+func (i *IBFT) recordPhaseEnd(ev phaseEndEvent) {
+	if !ev.hasEvent {
+		return
+	}
+
+	snap := PhaseSnapshot{
+		Phase:      canonicalPhaseName(ev.phase),
+		Status:     phaseStatusCompleted,
+		Height:     ev.height,
+		Round:      ev.round,
+		StartedAt:  ev.startedAt,
+		EndedAt:    ev.endedAt,
+		DurationMs: ev.duration.Milliseconds(),
+		Proposer:   append([]byte(nil), ev.proposer...),
+		Proposal:   cloneProposalSnapshot(ev.proposal),
+		LatestPC:   clonePreparedCertificate(ev.latestPC),
+	}
+
+	// Message/quorum capture happens AFTER releasing the state lock (caller already did).
+	i.fillPhaseVotes(&snap, ev.height, ev.round, ev.proposer)
+	// Archive keeps compact voter lists; signatures are not needed for phase history.
+	for name, group := range snap.Messages {
+		snap.Messages[name] = compactMessageTypeSnapshot(group)
+	}
+
+	i.archive.appendPhase(snap)
+	i.notifyDiagnosticsChanged()
+}
+
+func (i *IBFT) fillPhaseVotes(snap *PhaseSnapshot, height, round uint64, proposalFrom []byte) {
+	snap.Quorum = make(map[string]QuorumProgress, 4)
+	snap.Messages = make(map[string]MessageTypeSnapshot, 4)
+
+	// Runs on the consensus goroutine right after a phase transition; the
+	// validator set and message store are not contended here, so wait for them
+	// rather than leaving holes in the archived phase.
+	validators, quorumSize, _, vok := i.validatorManager.snapshot(true)
+	powerIndex := buildPowerIndex(validators)
+	view := &proto.View{Height: height, Round: round}
+
+	snapper, hasSnapper := i.messages.(messageSnapshotter)
+	if !hasSnapper {
+		return
+	}
+
+	for _, mt := range []proto.MessageType{
+		proto.MessageType_PREPREPARE,
+		proto.MessageType_PREPARE,
+		proto.MessageType_COMMIT,
+		proto.MessageType_ROUND_CHANGE,
+	} {
+		name := messageTypeName(mt)
+		msgs, truncated := snapper.GetViewMessages(view, mt, maxMessagesPerType)
+
+		entry := MessageTypeSnapshot{
+			Available:  true,
+			Truncated:  truncated,
+			ViewHeight: height,
+			ViewRound:  round,
+			Messages:   make([]MessageSnapshot, 0, len(msgs)),
+		}
+		for _, m := range msgs {
+			entry.Messages = append(entry.Messages, toMessageSnapshot(m))
+		}
+
+		snap.Messages[name] = entry
+
+		if vok {
+			snap.Quorum[name] = computeQuorumProgress(mt, msgs, proposalFrom, powerIndex, quorumSize)
+		} else {
+			snap.Quorum[name] = QuorumProgress{Available: false, Count: len(msgs)}
+		}
+	}
+}
+
+func (i *IBFT) finalizeSequenceArchive(result sequenceEndResult) {
+	i.recordPhaseEnd(result.phaseEvent)
+
+	// Build the final height view from live state (proposal/seals/validators).
+	// This runs on the consensus goroutine after the round's workers have been
+	// torn down, so a blocking read is safe and guarantees the archived height
+	// carries the real status/height instead of a fallback.
+	now := time.Now()
+	live, _ := i.buildHeightState(now, true)
+	final := heightArchiveFromLive(live)
+
+	i.archive.finalizeCurrent(final.Status, final.LastRoundEndReason, now, final)
+	i.notifyDiagnosticsChanged()
+}
+
+func heightArchiveFromLive(live *HeightState) *HeightArchive {
+	if live == nil {
+		return nil
+	}
+
+	return &HeightArchive{
+		Status:             live.Status,
+		Height:             live.Height,
+		Round:              live.Round,
+		Phase:              live.Phase,
+		RoundStarted:       live.RoundStarted,
+		LastRoundEndReason: live.LastRoundEndReason,
+		SequenceStartedAt:  live.SequenceStartedAt,
+		RoundStartedAt:     live.RoundStartedAt,
+		PhaseStartedAt:     live.PhaseStartedAt,
+		Proposer:           append([]byte(nil), live.Proposer...),
+		IsProposer:         live.IsProposer,
+		Proposal:           cloneProposalSnapshot(live.Proposal),
+		Validators:         cloneValidators(live.Validators),
+		TotalVotingPower:   live.TotalVotingPower,
+		QuorumSize:         live.QuorumSize,
+		RoundHistory:       append([]RoundSummary(nil), live.RoundHistory...),
+		LatestPC:           clonePreparedCertificate(live.LatestPC),
+		CommittedSeals:     cloneCommittedSeals(live.CommittedSeals),
+	}
 }
 
 func (i *IBFT) buildProposal(ctx context.Context, view *proto.View) *proto.IbftMessage {
@@ -1106,7 +1239,7 @@ func (i *IBFT) buildProposal(ctx context.Context, view *proto.View) *proto.IbftM
 func (i *IBFT) acceptProposal(proposalMessage *proto.IbftMessage) {
 	//	accept newly proposed block and move to PREPARE state
 	i.state.setProposalMessage(proposalMessage)
-	i.state.changeState(prepare)
+	i.recordPhaseEnd(i.state.changeState(prepare))
 }
 
 // AddMessage adds a new message to the IBFT message system
@@ -1119,6 +1252,7 @@ func (i *IBFT) AddMessage(message *proto.IbftMessage) {
 	// Check if the message should even be considered
 	if i.isAcceptableMessage(message) {
 		i.messages.AddMessage(message)
+		i.notifyDiagnosticsChanged()
 
 		// Signal event if the quorum is reached. Since the subscriptions refer to the state height,
 		// no need to call this if the message height is not equal to the state height

@@ -1310,7 +1310,7 @@ func TestIBFT_MoveToNewRound(t *testing.T) {
 
 		i := NewIBFT(log, backend, transport)
 
-		i.moveToNewRound(expectedNewRound)
+		i.moveToNewRound(expectedNewRound, RoundEndTimeout)
 
 		// Make sure the view has changed
 		assert.Equal(t, expectedNewRound, i.state.getRound())
